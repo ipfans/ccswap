@@ -25,6 +25,21 @@ BALANCE_GAP="${BALANCE_GAP:-25}"
 # Persistent trace log for failures and switch decisions.
 CCSWAP_LOG_FILE="${CCSWAP_LOG_FILE:-${HOME:-.}/.claude-swap/ccswap.log}"
 
+# Claude settings file used by Claude Code. Codex Proxy fallback only touches
+# the top-level "env" object in this JSON file.
+CLAUDE_SETTINGS_FILE="${CLAUDE_SETTINGS_FILE:-${HOME:-.}/.claude/settings.json}"
+
+# Codex Proxy env values written to ~/.claude/settings.json when every Claude
+# account path is exhausted.
+CODEX_PROXY_BASE_URL="http://127.0.0.1:18765"
+CODEX_PROXY_AUTH_TOKEN="unused"
+CODEX_PROXY_MODEL="gpt-5.5[1m]"
+CODEX_PROXY_SMALL_FAST_MODEL="gpt-5.4-mini[1m]"
+CODEX_PROXY_AUTO_COMPACT_WINDOW="272000"
+CODEX_PROXY_EFFORT_LEVEL="high"
+CODEX_PROXY_DISABLE_NONESSENTIAL_TRAFFIC="1"
+CODEX_PROXY_DISABLE_NONSTREAMING_FALLBACK="1"
+
 write_log_line() {
   local stream="$1" line log_dir
   shift
@@ -45,6 +60,9 @@ write_log_line() {
 
 log() { write_log_line stdout "$*"; }
 err() { write_log_line stderr "ERROR: $*"; }
+
+codex_proxy_status="skipped"
+settings_edit_error=""
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -91,12 +109,139 @@ append_probe_trace() {
   probe_trace+="$line"
 }
 
+edit_codex_proxy_env() {
+  local action="$1" reason="${2:-manual}" output status changed
+
+  set +e
+  output="$(python3 - "$action" "$CLAUDE_SETTINGS_FILE" \
+    "$CODEX_PROXY_BASE_URL" \
+    "$CODEX_PROXY_AUTH_TOKEN" \
+    "$CODEX_PROXY_MODEL" \
+    "$CODEX_PROXY_SMALL_FAST_MODEL" \
+    "$CODEX_PROXY_AUTO_COMPACT_WINDOW" \
+    "$CODEX_PROXY_EFFORT_LEVEL" \
+    "$CODEX_PROXY_DISABLE_NONESSENTIAL_TRAFFIC" \
+    "$CODEX_PROXY_DISABLE_NONSTREAMING_FALLBACK" <<'PY' 2>&1
+import json
+import os
+import stat
+import sys
+import tempfile
+
+action, path = sys.argv[1], os.path.expanduser(sys.argv[2])
+proxy_env = {
+    "ANTHROPIC_BASE_URL": sys.argv[3],
+    "ANTHROPIC_AUTH_TOKEN": sys.argv[4],
+    "ANTHROPIC_MODEL": sys.argv[5],
+    "ANTHROPIC_SMALL_FAST_MODEL": sys.argv[6],
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": int(sys.argv[7]),
+    "CLAUDE_CODE_EFFORT_LEVEL": sys.argv[8],
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": int(sys.argv[9]),
+    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": int(sys.argv[10]),
+}
+
+if action not in {"enable", "disable"}:
+    raise SystemExit(f"unknown action: {action}")
+
+exists = os.path.exists(path)
+mode = 0o600
+data = {}
+
+if exists:
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    with open(path, "r", encoding="utf-8") as fh:
+        content = fh.read()
+    data = json.loads(content) if content.strip() else {}
+    if not isinstance(data, dict):
+        raise ValueError("settings JSON top-level value must be an object")
+elif action == "disable":
+    print("changed=0")
+    raise SystemExit(0)
+
+env = data.get("env")
+if env is None:
+    if action == "disable":
+        print("changed=0")
+        raise SystemExit(0)
+    env = {}
+    data["env"] = env
+elif not isinstance(env, dict):
+    raise ValueError("settings JSON env value must be an object")
+
+before = dict(env)
+if action == "enable":
+    env.update(proxy_env)
+else:
+    for key in proxy_env:
+        env.pop(key, None)
+
+changed = int(env != before)
+if changed:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+print(f"changed={changed}")
+PY
+  )"
+  status=$?
+  set -e
+
+  changed="$(printf '%s\n' "$output" | awk -F= '$1 == "changed" { print $2; exit }')"
+  if [[ "$status" -ne 0 ]]; then
+    settings_edit_error="$(compact_text "$output")"
+    codex_proxy_status="${action}-failed"
+    err "failed to ${action} Codex Proxy env in ${CLAUDE_SETTINGS_FILE}: ${settings_edit_error}"
+    return "$status"
+  fi
+
+  settings_edit_error=""
+  if [[ "$action" == "enable" ]]; then
+    codex_proxy_status="enabled"
+    if [[ "$changed" == "1" ]]; then
+      log "Codex Proxy env enabled in ${CLAUDE_SETTINGS_FILE} (${reason})"
+    else
+      log "Codex Proxy env already enabled in ${CLAUDE_SETTINGS_FILE} (${reason})"
+    fi
+  else
+    if [[ "$changed" == "1" ]]; then
+      codex_proxy_status="disabled"
+      log "Codex Proxy env removed from ${CLAUDE_SETTINGS_FILE} (${reason})"
+    else
+      codex_proxy_status="disabled-noop"
+    fi
+  fi
+}
+
+enable_codex_proxy_env() {
+  edit_codex_proxy_env enable "$1"
+}
+
+disable_codex_proxy_env() {
+  edit_codex_proxy_env disable "$1"
+}
+
 log_failure_context() {
   local failure_reason="$1" probe_details="${2:-not run}" final_active="${3:-unknown}"
 
   log "failure trace start"
   log "reason: $failure_reason"
   log "log_file: ${CCSWAP_LOG_FILE:-disabled}"
+  log "claude_settings_file: ${CLAUDE_SETTINGS_FILE}"
+  log "codex_proxy_status: ${codex_proxy_status}"
+  log "settings_edit_error: ${settings_edit_error:-none}"
   log "thresholds: 5h>${USAGE_THRESHOLD}% 7d>${WEEKLY_THRESHOLD}% balance_gap=${BALANCE_GAP}% tiers=${PRIORITY_TIERS}"
   log "active_at_start: ${original_active:-$active_account}; active_at_failure: ${final_active:-unknown}"
   log "chosen_known_account: ${chosen:-none} 5h=${chosen_5h:-unknown}% 7d=${chosen_7d:-unknown}% tier=${chosen_tier:-unknown}"
@@ -110,8 +255,30 @@ log_failure_context() {
 LAST_PROBE_OUTPUT=""
 LAST_PROBE_STATUS=""
 
+claude_probe_failure_kind() {
+  local output="$1"
+
+  if printf '%s\n' "$output" | grep -Fq "You've hit your session limit"; then
+    printf 'session-limit\n'
+    return
+  fi
+
+  if printf '%s\n' "$output" | grep -Fq "Your organization has disabled Claude subscription access for Claude Code"; then
+    printf 'subscription-disabled\n'
+    return
+  fi
+
+  printf 'probe-error\n'
+}
+
 run_claude_probe() {
-  local probe_output probe_status
+  local probe_output probe_status failure_kind
+
+  if ! disable_codex_proxy_env "before Claude quota probe"; then
+    LAST_PROBE_OUTPUT="failed to disable Codex Proxy env: ${settings_edit_error:-unknown settings edit error}"
+    LAST_PROBE_STATUS="settings-edit"
+    return 3
+  fi
 
   set +e
   probe_output="$(claude -p hello 2>&1)"
@@ -120,10 +287,16 @@ run_claude_probe() {
 
   LAST_PROBE_OUTPUT="$probe_output"
   LAST_PROBE_STATUS="$probe_status"
+  failure_kind="$(claude_probe_failure_kind "$probe_output")"
 
-  if printf '%s\n' "$probe_output" | grep -Fq "You've hit your session limit"; then
+  if [[ "$failure_kind" == "session-limit" ]]; then
     printf '%s\n' "$probe_output" >&2
     return 2
+  fi
+
+  if [[ "$failure_kind" == "subscription-disabled" ]]; then
+    printf '%s\n' "$probe_output" >&2
+    return 4
   fi
 
   if [[ "$probe_status" -ne 0 ]]; then
@@ -137,8 +310,23 @@ run_claude_probe() {
   return 0
 }
 
+activate_codex_proxy_fallback() {
+  local fallback_reason="$1" probe_details="${2:-not run}" final_active="${3:-unknown}"
+
+  if enable_codex_proxy_env "$fallback_reason"; then
+    log_failure_context "${fallback_reason}; Codex Proxy enabled" "$probe_details" "$final_active"
+    log "Codex Proxy fallback enabled; Claude will use ${CODEX_PROXY_BASE_URL}"
+    exit 0
+  fi
+
+  log_failure_context "failed to enable Codex Proxy fallback: ${fallback_reason}" "$probe_details" "$final_active"
+  err "failed to enable Codex Proxy fallback"
+  exit 1
+}
+
 require_cmd cswap
 require_cmd claude
+require_cmd python3
 
 for var in USAGE_THRESHOLD WEEKLY_THRESHOLD BALANCE_GAP; do
   val="${!var}"
@@ -434,9 +622,7 @@ while IFS='=' read -r key value; do
 done <<< "$decision"
 
 if [[ "$action" == "fail" ]]; then
-  log_failure_context "$reason" "probe not run" "${active_account:-unknown}"
-  err "$reason"
-  exit 1
+  activate_codex_proxy_fallback "$reason" "probe not run" "${active_account:-unknown}"
 fi
 
 if [[ "$action" == "switch" ]]; then
@@ -451,6 +637,11 @@ if [[ "$action" == "switch" ]]; then
     if [[ "$probe_status" -eq 2 ]]; then
       append_probe_trace "$chosen" "session-limit-after-switch" "$LAST_PROBE_STATUS" "$(compact_text "$LAST_PROBE_OUTPUT")"
       err "account ${chosen} hit session limit after switch"
+      activate_codex_proxy_fallback "account ${chosen} hit session limit after switch" "$probe_trace" "$chosen"
+    elif [[ "$probe_status" -eq 4 ]]; then
+      append_probe_trace "$chosen" "subscription-disabled-after-switch" "$LAST_PROBE_STATUS" "$(compact_text "$LAST_PROBE_OUTPUT")"
+      err "account ${chosen} has Claude subscription access disabled after switch"
+      activate_codex_proxy_fallback "account ${chosen} has Claude subscription access disabled after switch" "$probe_trace" "$chosen"
     else
       append_probe_trace "$chosen" "probe-error-after-switch" "$LAST_PROBE_STATUS" "$(compact_text "$LAST_PROBE_OUTPUT")"
       err "claude warmup failed after switching to account ${chosen}"
@@ -462,6 +653,7 @@ elif [[ "$action" == "probe" ]]; then
   log "$reason: ${probe_candidates}"
   original_active="$active_account"
   probe_trace=""
+  probe_had_non_fallback_failure=0
 
   for candidate in $probe_candidates; do
     if [[ -n "$active_account" && "$candidate" == "$active_account" ]]; then
@@ -481,8 +673,12 @@ elif [[ "$action" == "probe" ]]; then
       if [[ "$probe_status" -eq 2 ]]; then
         append_probe_trace "$candidate" "session-limit" "$LAST_PROBE_STATUS" "$(compact_text "$LAST_PROBE_OUTPUT")"
         log "account ${candidate} hit session limit; trying next usage-unavailable account"
+      elif [[ "$probe_status" -eq 4 ]]; then
+        append_probe_trace "$candidate" "subscription-disabled" "$LAST_PROBE_STATUS" "$(compact_text "$LAST_PROBE_OUTPUT")"
+        log "account ${candidate} has Claude subscription access disabled; trying next usage-unavailable account"
       else
         append_probe_trace "$candidate" "probe-error" "$LAST_PROBE_STATUS" "$(compact_text "$LAST_PROBE_OUTPUT")"
+        probe_had_non_fallback_failure=1
         err "claude probe failed for account ${candidate}; trying next usage-unavailable account"
       fi
     fi
@@ -497,9 +693,17 @@ elif [[ "$action" == "probe" ]]; then
     fi
   fi
 
+  if [[ "$probe_had_non_fallback_failure" -eq 0 ]]; then
+    activate_codex_proxy_fallback "no Claude account available; all probes hit session limit or subscription access is disabled" "$probe_trace" "${active_account:-unknown}"
+  fi
+
   log_failure_context "no account with available balance found" "$probe_trace" "${active_account:-unknown}"
   err "no account with available balance found"
   exit 1
 else
+  if ! disable_codex_proxy_env "Claude account available; ${reason}"; then
+    log_failure_context "failed to remove Codex Proxy env while Claude account is available" "probe not run" "${active_account:-unknown}"
+    exit 1
+  fi
   log "$reason; no switch"
 fi
